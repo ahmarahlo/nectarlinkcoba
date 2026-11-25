@@ -45,7 +45,9 @@ class AppDisplay(
     /** The display's size and density now, to turn it with its app. */
     @Volatile private var size = Triple(width, height, dpi)
     private var lastRotationCheck = 0L
+    private var rotatedForOrientation = false
     private var display: VirtualDisplay? = null
+    private var mirrorToken: android.os.IBinder? = null
     /** Owns [display] when it has one; closed after it. */
     private var device: VirtualDevice? = null
 
@@ -66,13 +68,17 @@ class AppDisplay(
             val first = createEncoder(curW, curH)
             codec = first.codec
             surface = first.surface
-            val made = if (fullScreen) {
-                createMirrorDisplay(curW, curH, curDpi, first.surface)
+            val made: VirtualDisplay? = if (fullScreen) {
+                runCatching { createMirrorDisplay(curW, curH, curDpi, first.surface) }.getOrElse { err ->
+                    System.err.println("DisplayManager mirror failed ($err); trying SurfaceControl fallback")
+                    mirrorToken = createSurfaceControlMirror(curW, curH, first.surface)
+                    null
+                }
             } else {
                 createDisplay(curW, curH, curDpi, first.surface)
             }
             display = made
-            displayId = if (fullScreen) 0 else made.display.displayId
+            displayId = if (fullScreen) 0 else made!!.display.displayId
             if (!fullScreen) {
                 hideIme(displayId)
             }
@@ -94,8 +100,8 @@ class AppDisplay(
                 if (newW == curW && newH == curH) {
                     // Only the density (the PC's zoom): the picture's size
                     // stays, so the encoder does too, and nothing restarts.
-                    made.resize(curW, curH, newDpi)
-                    forceDensity(displayId, newDpi)
+                    made?.resize(curW, curH, newDpi)
+                    if (!fullScreen) forceDensity(displayId, newDpi)
                     curDpi = newDpi
                     size = Triple(curW, curH, curDpi)
                     continue
@@ -110,8 +116,12 @@ class AppDisplay(
                 codec = next.codec
                 surface = next.surface
                 codecForKeyframes = next.codec
-                made.resize(newW, newH, newDpi)
-                made.surface = next.surface
+                if (made != null) {
+                    made.resize(newW, newH, newDpi)
+                    made.surface = next.surface
+                } else {
+                    mirrorToken?.let { updateSurfaceControlMirror(it, newW, newH, next.surface) }
+                }
                 curW = newW
                 curH = newH
                 curDpi = newDpi
@@ -127,6 +137,8 @@ class AppDisplay(
             runCatching { surface?.release() }
             display?.release()
             display = null
+            mirrorToken?.let { destroySurfaceControlMirror(it) }
+            mirrorToken = null
             device?.close()
             device = null
         }
@@ -151,8 +163,15 @@ class AppDisplay(
         lastRotationCheck = now
         val rotation = runCatching { display?.display?.rotation }.getOrNull() ?: return
         if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
-            val (w, h, d) = size
-            nextSize = Triple(h, w, d)
+            if (!rotatedForOrientation) {
+                val (w, h, d) = size
+                if (w < h) {
+                    rotatedForOrientation = true
+                    nextSize = Triple(h, w, d)
+                }
+            }
+        } else {
+            rotatedForOrientation = false
         }
     }
 
@@ -320,6 +339,64 @@ class AppDisplay(
                 surface,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             )
+        }
+    }
+
+    /**
+     * Fallback mirror display for Android 11-13 (e.g. ColorOS 13) where shell
+     * does not hold CAPTURE_VIDEO_OUTPUT for DisplayManager AUTO_MIRROR.
+     */
+    private fun createSurfaceControlMirror(w: Int, h: Int, surface: Surface): android.os.IBinder {
+        val sc = Class.forName("android.view.SurfaceControl")
+        val token = sc.getMethod("createDisplay", String::class.java, Boolean::class.javaPrimitiveType)
+            .invoke(null, "NectarlinkScreen", false) as android.os.IBinder
+        updateSurfaceControlMirror(token, w, h, surface)
+        return token
+    }
+
+    @Suppress("DEPRECATION")
+    private fun updateSurfaceControlMirror(token: android.os.IBinder, w: Int, h: Int, surface: Surface) {
+        val sc = Class.forName("android.view.SurfaceControl")
+        val openTx = sc.getMethod("openTransaction")
+        val closeTx = sc.getMethod("closeTransaction")
+        val setSurface = sc.getMethod("setDisplaySurface", android.os.IBinder::class.java, Surface::class.java)
+        val setProjection = sc.getMethod(
+            "setDisplayProjection",
+            android.os.IBinder::class.java,
+            Int::class.javaPrimitiveType,
+            android.graphics.Rect::class.java,
+            android.graphics.Rect::class.java,
+        )
+        val setLayerStack = sc.getMethod("setDisplayLayerStack", android.os.IBinder::class.java, Int::class.javaPrimitiveType)
+        val srcRect = mainDisplayRect(w, h)
+        val dstRect = android.graphics.Rect(0, 0, w, h)
+        openTx.invoke(null)
+        try {
+            setSurface.invoke(null, token, surface)
+            setProjection.invoke(null, token, 0, srcRect, dstRect)
+            setLayerStack.invoke(null, token, 0)
+        } finally {
+            closeTx.invoke(null)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun mainDisplayRect(fallbackW: Int, fallbackH: Int): android.graphics.Rect = runCatching {
+        val dm = ShellContext.get().getSystemService(DisplayManager::class.java)
+        val main = dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+        val pt = android.graphics.Point()
+        main?.getRealSize(pt)
+        if (pt.x > 0 && pt.y > 0) {
+            android.graphics.Rect(0, 0, pt.x, pt.y)
+        } else {
+            android.graphics.Rect(0, 0, fallbackW, fallbackH)
+        }
+    }.getOrElse { android.graphics.Rect(0, 0, fallbackW, fallbackH) }
+
+    private fun destroySurfaceControlMirror(token: android.os.IBinder) {
+        runCatching {
+            val sc = Class.forName("android.view.SurfaceControl")
+            sc.getMethod("destroyDisplay", android.os.IBinder::class.java).invoke(null, token)
         }
     }
 
